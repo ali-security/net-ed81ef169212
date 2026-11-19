@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,65 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributeParserMisalignment(t *testing.T) {
+	// Browsers keep only the first of a set of duplicate attributes. If the
+	// later "encoding" attribute were kept, the parser would treat
+	// annotation-xml as an HTML integration point and parse the <img> as
+	// <style> raw text, while a browser parses it as an <img> element.
+	for _, src := range []string{
+		`<math><annotation-xml encoding="x" encoding="text/html"><style><img src=x onerror=alert(1)></style></annotation-xml></math>`,
+		`<math><annotation-xml encoding="x" ENCODING="text/html"><style><img src=x onerror=alert(1)></style></annotation-xml></math>`,
+	} {
+		doc, err := Parse(strings.NewReader(src))
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", src, err)
+		}
+		var annotation, img *Node
+		var walk func(*Node)
+		walk = func(n *Node) {
+			if n.Type == ElementNode {
+				if n.Namespace == "math" && n.Data == "annotation-xml" {
+					annotation = n
+				}
+				if n.Namespace == "" && n.Data == "img" {
+					img = n
+				}
+			}
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				walk(c)
+			}
+		}
+		walk(doc)
+		if annotation == nil {
+			t.Fatalf("Parse(%q): no annotation-xml element", src)
+		}
+		if len(annotation.Attr) != 1 || annotation.Attr[0].Key != "encoding" || annotation.Attr[0].Val != "x" {
+			t.Errorf("Parse(%q): annotation-xml attributes = %v, want [{ encoding x}]", src, annotation.Attr)
+		}
+		if img == nil {
+			t.Errorf("Parse(%q): <img> was not parsed as an element", src)
+		}
+	}
+}
