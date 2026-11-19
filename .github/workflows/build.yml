@@ -1,0 +1,119 @@
+name: build-and-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two Go releases supported when v0.45.0 shipped (go.mod: go 1.24.0).
+        # http2's synctest-based tests (transport_test.go etc.) are gated on
+        # `go1.25 || goexperiment.synctest`, so 1.24 enables the experiment.
+        include:
+          - go: "1.24"
+            goexperiment: synctest
+          - go: "1.25"
+            goexperiment: ""
+    env:
+      GOTOOLCHAIN: local
+      GOEXPERIMENT: ${{ matrix.goexperiment }}
+      MODULE_PATH: golang.org/x/net
+      MODULE_VERSION: v0.45.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Produce module zip
+        if: matrix.go == '1.25'
+        env:
+          GOEXPERIMENT: ""
+        run: |
+          set -euo pipefail
+          # Copy the module tree outside the workspace and drop this CI workflow
+          # (not part of upstream's module) before zipping with Go's own
+          # module-zip implementation (golang.org/x/mod/zip.CreateFromDir).
+          SRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$SRC"
+          tar -C "$GITHUB_WORKSPACE" --exclude=./.git -cf - . | tar -C "$SRC" -xf -
+          rm -f "$SRC/.github/workflows/build.yml"
+          if [ -d "$SRC/.github" ]; then find "$SRC/.github" -depth -type d -empty -delete; fi
+          HELPER="$RUNNER_TEMP/modzip"
+          mkdir -p "$HELPER" "$RUNNER_TEMP/build_output"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+          	"log"
+          	"os"
+
+          	"golang.org/x/mod/module"
+          	"golang.org/x/mod/zip"
+          )
+
+          func main() {
+          	if len(os.Args) != 5 {
+          		log.Fatal("usage: modzip <module-path> <version> <source-dir> <output-zip>")
+          	}
+          	m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+          	f, err := os.Create(os.Args[4])
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer f.Close()
+          	if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+          		log.Fatal(err)
+          	}
+          	log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$HELPER"
+          go mod init example.com/modzip
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$SRC" "$RUNNER_TEMP/build_output/$MODULE_VERSION.zip"
+          unzip -l "$RUNNER_TEMP/build_output/$MODULE_VERSION.zip" | tail -1
+
+      - name: Build
+        run: |
+          go version
+          go build ./...
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }; done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            echo "SKIPPED TESTS (name and reason):"
+            # go test -v prints a test's t.Skip message BEFORE its "--- SKIP" line,
+            # so buffer the output of each running test and print it on skip.
+            awk '
+              /^=== (RUN|CONT|PAUSE|NAME)[[:space:]]/ { cur = $3; if ($2 == "RUN") msg[cur] = ""; next }
+              /^[[:space:]]*--- SKIP: / { name = $3; print "SKIP " name " -- reason:" msg[name]; next }
+              /^[[:space:]]+[^[:space:]]+\.go:[0-9]+: / { if (cur != "") { sub(/^[[:space:]]+/, " "); msg[cur] = msg[cur] $0 } }
+            ' "$RUNNER_TEMP/full.log"
+            awk '/^[[:space:]]*--- PASS/ {p++} /^[[:space:]]*--- FAIL/ {f++} /^[[:space:]]*--- SKIP/ {s++} END {printf "TEST SUMMARY: %d passed, %d failed, %d skipped\n", p, f, s}' "$RUNNER_TEMP/full.log"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == '1.25'
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/*.zip
+          if-no-files-found: error
